@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
 
 from pydantic import BaseModel
@@ -8,9 +9,11 @@ from pydantic import BaseModel
 from models import Task, TaskStatus, UserProfile
 
 # Firebase Admin
+import json
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth
 from firebase_admin.exceptions import FirebaseError
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 
 app = FastAPI(
@@ -33,13 +36,31 @@ db: Optional[firestore.Client] = None
 
 def initialize_firebase() -> None:
     global db
-    if not FIREBASE_CREDENTIALS_PATH or not os.path.exists(FIREBASE_CREDENTIALS_PATH):
-        print("⚠️ FIREBASE_CREDENTIALS_PATH no configurada o archivo no encontrado. Usando almacenamiento en memoria.")
-        return
+    # Permitir credenciales vía ruta o vía JSON en variable de entorno
+    cred_obj = None
 
+    cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+    if cred_json:
+        try:
+            cred_dict = json.loads(cred_json)
+            cred_obj = credentials.Certificate(cred_dict)
+        except Exception as e:
+            print(f"❌ FIREBASE_CREDENTIALS_JSON inválida: {e}")
+
+    # Si no hay JSON válido, intentar con ruta en FIREBASE_CREDENTIALS_PATH
+    if cred_obj is None:
+        if not FIREBASE_CREDENTIALS_PATH or not os.path.exists(FIREBASE_CREDENTIALS_PATH):
+            print("⚠️ FIREBASE_CREDENTIALS_PATH no configurada o archivo no encontrado. Usando almacenamiento en memoria.")
+            return
+        try:
+            cred_obj = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+        except Exception as e:
+            print(f"❌ Error leyendo FIREBASE_CREDENTIALS_PATH: {e}")
+            return
+
+    # Inicializar firebase con credenciales obtenidas
     try:
-        cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
-        firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred_obj)
         db = firestore.client()
         print("✅ Firebase inicializado. Firestore listo.")
     except Exception as e:
@@ -58,6 +79,40 @@ users: Dict[str, UserProfile] = {}
 def check_db_connection():
     if db is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Firestore no inicializado. Configura FIREBASE_CREDENTIALS_PATH.")
+
+
+# --- CORS setup ---
+# Allow origins configured by FRONTEND_ORIGINS env var (comma-separated), defaults to typical dev ports
+frontend_origins = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000")
+allow_origins = [o.strip() for o in frontend_origins.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- Authentication dependency (Firebase ID Token) ---
+security_scheme = HTTPBearer(description="Provide Firebase ID token as Bearer token")
+
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)) -> str:
+    """Verifica el ID Token de Firebase y devuelve el `uid` del usuario."""
+    token = credentials.credentials
+    try:
+        decoded = auth.verify_id_token(token)
+        uid = decoded.get("uid")
+        if not uid:
+            raise Exception("UID no presente en token")
+        return uid
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token inválido o expirado: {e}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 @app.get("/", tags=["Root"])
@@ -225,5 +280,13 @@ async def update_user(uid: str, updated: UserProfile):
         return updated
     except FirebaseError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+if __name__ == "__main__":
+    # Permite arrancar la app con `python main.py` (sin hot-reload).
+    # Para desarrollo con autoreload usa: `python -m uvicorn main:app --reload`
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
 

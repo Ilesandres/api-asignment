@@ -1,0 +1,8 @@
+# Ignore environment and service account keys
+.env
+serviceAccountKey.json
+seviceAccountKey.json
+__pycache__/
+*.pyc
+.venv/
+venv/
