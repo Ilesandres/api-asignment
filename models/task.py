@@ -14,7 +14,6 @@ class TaskStatus(str, Enum):
 
 
 class Task(BaseModel):
-    """Modelo Pydantic para una tarea (Task) extraída del frontend."""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="ID único")
     title: str = Field(..., description="Título de la tarea")
     description: Optional[str] = Field(None, description="Descripción opcional")

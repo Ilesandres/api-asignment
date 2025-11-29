@@ -6,7 +6,6 @@ import uuid
 
 
 class UserProfile(BaseModel):
-    """Modelo Pydantic para UserProfile extraído del frontend."""
     uid: str = Field(..., description="UID de Firebase")
     email: EmailStr = Field(..., description="Correo electrónico")
     displayName: Optional[str] = Field(None, description="Nombre para mostrar")
