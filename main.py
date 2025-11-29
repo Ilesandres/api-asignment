@@ -4,9 +4,17 @@ from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Optional
 
-from pydantic import BaseModel
+# Se importa para usar TaskStatus como tipo de query
+from pydantic import BaseModel 
 
 from models import Task, TaskStatus, UserProfile
+from services.task_service import (
+    list_tasks_service,
+    create_task_service,
+    get_task_service,
+    update_task_service,
+    delete_task_service
+) # <-- NUEVAS IMPORTACIONES
 
 # Firebase Admin
 import json
@@ -17,7 +25,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 
 app = FastAPI(
-    title="FastAPI Front (Firestore optional)",
+    title="FastAPI Firestore Task/User API",
     description="CRUD para Task y UserProfile usando Firestore si hay credenciales, con fallback in-memory.",
     version="0.1.0",
 )
@@ -102,12 +110,22 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     """Verifica el ID Token de Firebase y devuelve el `uid` del usuario."""
     token = credentials.credentials
     try:
-        decoded = auth.verify_id_token(token)
-        uid = decoded.get("uid")
+        # En un entorno real, descomentar la siguiente línea
+        # decoded = auth.verify_id_token(token) 
+        
+        # << Sustituto temporal para pruebas si no tienes un ID Token real >>
+        # Si el token es "TEST_USER_123", lo aceptamos como uid para pruebas locales
+        if token.startswith("TEST_USER_"):
+            uid = token 
+        else:
+            decoded = auth.verify_id_token(token) # Línea real de Firebase
+            uid = decoded.get("uid")
+
         if not uid:
             raise Exception("UID no presente en token")
         return uid
     except Exception as e:
+        # Esto capturaría errores reales de auth.verify_id_token
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Token inválido o expirado: {e}",
@@ -120,95 +138,87 @@ async def root():
     return {"message": "FastAPI front ready (Firestore: %s)" % ("connected" if db else "in-memory")}
 
 
-"""TASKS CRUD (Firestore cuando esté disponible)"""
-
+"""TASKS CRUD (REFACTORIZADO CON SERVICIOS Y SEGURIDAD)"""
 
 @app.get("/tasks/", response_model=List[Task], tags=["Tasks"])
-async def list_tasks():
-    if db is None:
-        return list(tasks.values())
-    try:
-        docs = db.collection(COLLECTION_TASKS).stream()
-        result: List[Task] = []
-        for doc in docs:
-            data = doc.to_dict()
-            result.append(Task(id=doc.id, **data))
-        return result
-    except FirebaseError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+async def list_tasks(
+    status_filter: Optional[TaskStatus] = None, # Permite filtrar por estado
+    current_user_uid: Optional[str] = Depends(verify_token) # Autenticación Opcional: si se provee, filtramos por dueño
+):
+    """Lista tareas, opcionalmente filtrando por dueño si se provee token."""
+    return await list_tasks_service(
+        db=db,
+        in_memory_tasks=tasks,
+        current_user_uid=current_user_uid,
+        status_filter=status_filter
+    )
 
 
 @app.post("/tasks/", response_model=Task, status_code=status.HTTP_201_CREATED, tags=["Tasks"])
-async def create_task(task: Task):
-    if db is None:
-        if task.id in tasks:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task ID already exists")
-        tasks[task.id] = task
-        return task
-
-    # Firestore
-    try:
-        payload = task.model_dump()
-        _, doc_ref = db.collection(COLLECTION_TASKS).add(payload)
-        return Task(id=doc_ref.id, **payload)
-    except FirebaseError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+async def create_task(
+    task: Task,
+    current_user_uid: str = Depends(verify_token) # Requiere autenticación
+):
+    """Crea una nueva tarea, asignando al usuario autenticado como 'owner'."""
+    return await create_task_service(
+        task=task,
+        db=db,
+        in_memory_tasks=tasks,
+        current_user_uid=current_user_uid
+    )
 
 
 @app.get("/tasks/{task_id}", response_model=Task, tags=["Tasks"])
-async def get_task(task_id: str):
-    if db is None:
-        t = tasks.get(task_id)
-        if not t:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        return t
+async def get_task(
+    task_id: str,
+    current_user_uid: str = Depends(verify_token) # Requiere autenticación
+):
+    """Obtiene una tarea. Lanza 403 si el usuario no es el dueño."""
+    # Obtener la tarea a través del servicio
+    task = await get_task_service(task_id=task_id, db=db, in_memory_tasks=tasks)
 
-    try:
-        doc = db.collection(COLLECTION_TASKS).document(task_id).get()
-        if not doc.exists:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        data = doc.to_dict()
-        return Task(id=doc.id, **data)
-    except FirebaseError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    # Autorización: si la tarea tiene dueño, debe coincidir con el usuario actual.
+    if task.owner and task.owner != current_user_uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permiso para ver esta tarea."
+        )
+
+    return task
 
 
 @app.put("/tasks/{task_id}", response_model=Task, tags=["Tasks"])
-async def update_task(task_id: str, updated: Task):
-    if task_id != updated.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ID mismatch")
-
-    if db is None:
-        if task_id not in tasks:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        tasks[task_id] = updated
-        return updated
-
-    try:
-        doc_ref = db.collection(COLLECTION_TASKS).document(task_id)
-        if not doc_ref.get().exists:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        doc_ref.set(updated.model_dump())
-        return updated
-    except FirebaseError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+async def update_task(
+    task_id: str,
+    updated: Task,
+    current_user_uid: str = Depends(verify_token) # Requiere autenticación y Autorización (manejada en el servicio)
+):
+    """Actualiza una tarea. Solo el dueño puede hacerlo."""
+    return await update_task_service(
+        task_id=task_id,
+        updated_task=updated,
+        db=db,
+        in_memory_tasks=tasks,
+        current_user_uid=current_user_uid
+    )
 
 
 @app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Tasks"])
-async def delete_task(task_id: str):
-    if db is None:
-        if task_id in tasks:
-            del tasks[task_id]
-        return
-
-    try:
-        db.collection(COLLECTION_TASKS).document(task_id).delete()
-    except FirebaseError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+async def delete_task(
+    task_id: str,
+    current_user_uid: str = Depends(verify_token) # Requiere autenticación y Autorización (manejada en el servicio)
+):
+    """Elimina una tarea. Solo el dueño puede hacerlo."""
+    await delete_task_service(
+        task_id=task_id,
+        db=db,
+        in_memory_tasks=tasks,
+        current_user_uid=current_user_uid
+    )
     return
 
 
-"""USERS CRUD (Firestore opcional)"""
+"""USERS CRUD (Firestore opcional) - Se mantienen sin refactorizar por ahora"""
 
 
 @app.get("/users/", response_model=List[UserProfile], tags=["Users"])
@@ -288,5 +298,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
-
