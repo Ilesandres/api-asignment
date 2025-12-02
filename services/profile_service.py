@@ -28,6 +28,7 @@ async def get_profile_service(uid: str, db: Optional[firestore.Client] = None, i
         for k in ("memberSince", "createdAt", "updatedAt"):
             if k in data:
                 data[k] = _to_datetime(data[k])
+        data.pop("uid", None)
         return UserProfile(uid=doc.id, **data)
 
     if in_memory_users is None:
@@ -59,6 +60,7 @@ async def create_profile_service(uid: str, payload: Dict[str, Any], db: Optional
         for k in ("memberSince", "createdAt", "updatedAt"):
             if k in data:
                 data[k] = _to_datetime(data[k])
+        data.pop("uid", None)
         return UserProfile(uid=doc.id, **data)
 
     if in_memory_users is not None:
@@ -86,6 +88,7 @@ async def update_profile_service(uid: str, updates: Dict[str, Any], current_user
         for k in ("memberSince", "createdAt", "updatedAt"):
             if k in data:
                 data[k] = _to_datetime(data[k])
+        data.pop("uid", None)
         return UserProfile(uid=doc.id, **data)
 
     if in_memory_users is not None:
