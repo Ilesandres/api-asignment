@@ -14,7 +14,12 @@ from services.task_service import (
     get_task_service,
     update_task_service,
     delete_task_service
-) # <-- NUEVAS IMPORTACIONES
+) 
+from services.profile_service import (
+    get_profile_service,
+    create_profile_service,
+    update_profile_service,
+)
 
 # Firebase Admin
 import json
@@ -37,6 +42,7 @@ load_dotenv()
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH")
 COLLECTION_TASKS = os.getenv("FIRESTORE_COLLECTION_TASKS", "tasks")
 COLLECTION_USERS = os.getenv("FIRESTORE_COLLECTION_USERS", "users")
+COLLECTION_PROFILE = os.getenv("FIRESTORE_COLLECTION_PROFILE", "userProfiles")
 
 # Cliente Firestore (se inicializa en runtime o queda None)
 db: Optional[firestore.Client] = None
@@ -290,6 +296,64 @@ async def update_user(uid: str, updated: UserProfile):
         return updated
     except FirebaseError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+class ProfileCreate(BaseModel):
+    email: str
+    displayName: Optional[str] = None
+    photoURL: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+
+
+class ProfileUpdate(BaseModel):
+    displayName: Optional[str] = None
+    photoURL: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+
+
+@app.get("/profiles/{uid}", response_model=UserProfile, tags=["Profiles"])
+async def get_profile(uid: str):
+    """Obtener perfil por UID (público)."""
+    profile = await get_profile_service(uid=uid, db=db, in_memory_users=users)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    return profile
+
+
+@app.get("/profiles/me", response_model=UserProfile, tags=["Profiles"])
+async def get_my_profile(current_user_uid: str = Depends(verify_token)):
+    """Obtener el perfil del usuario autenticado. Si no existe, responde 404 (usa POST /profiles para crearlo)."""
+    profile = await get_profile_service(uid=current_user_uid, db=db, in_memory_users=users)
+    if not profile:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found. Create it with POST /profiles/")
+    return profile
+
+
+@app.post("/profiles/", response_model=UserProfile, status_code=status.HTTP_201_CREATED, tags=["Profiles"])
+async def create_profile(payload: ProfileCreate, current_user_uid: str = Depends(verify_token)):
+    """Crear perfil para el usuario autenticado. Si ya existe, devuelve el perfil existente."""
+    existing = await get_profile_service(uid=current_user_uid, db=db, in_memory_users=users)
+    if existing:
+        return existing
+
+    profile = await create_profile_service(uid=current_user_uid, payload=payload.model_dump(), db=db, in_memory_users=users)
+    return profile
+
+
+@app.put("/profiles/{uid}", response_model=UserProfile, tags=["Profiles"])
+async def update_profile(uid: str, updates: ProfileUpdate, current_user_uid: str = Depends(verify_token)):
+    """Actualizar perfil — solo el dueño puede actualizar su perfil."""
+    result = await update_profile_service(uid=uid, updates=updates.model_dump(exclude_none=True), current_user_uid=current_user_uid, db=db, in_memory_users=users)
+    if result is None:
+        # Puede ser por autorización o por inexistencia
+        # Determinar si existe para reportar 404 vs 403
+        existing = await get_profile_service(uid=uid, db=db, in_memory_users=users)
+        if not existing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update this profile")
+    return result
 
 
 if __name__ == "__main__":
